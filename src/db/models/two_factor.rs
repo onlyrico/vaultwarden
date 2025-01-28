@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use super::UserId;
 use crate::{api::EmptyResult, db::DbConn, error::MapResult};
 
 db_object! {
@@ -7,12 +8,12 @@ db_object! {
     #[diesel(table_name = twofactor)]
     #[diesel(primary_key(uuid))]
     pub struct TwoFactor {
-        pub uuid: String,
-        pub user_uuid: String,
+        pub uuid: TwoFactorId,
+        pub user_uuid: UserId,
         pub atype: i32,
         pub enabled: bool,
         pub data: String,
-        pub last_used: i32,
+        pub last_used: i64,
     }
 }
 
@@ -34,13 +35,16 @@ pub enum TwoFactorType {
     EmailVerificationChallenge = 1002,
     WebauthnRegisterChallenge = 1003,
     WebauthnLoginChallenge = 1004,
+
+    // Special type for Protected Actions verification via email
+    ProtectedActions = 2000,
 }
 
 /// Local methods
 impl TwoFactor {
-    pub fn new(user_uuid: String, atype: TwoFactorType, data: String) -> Self {
+    pub fn new(user_uuid: UserId, atype: TwoFactorType, data: String) -> Self {
         Self {
-            uuid: crate::util::get_uuid(),
+            uuid: TwoFactorId(crate::util::get_uuid()),
             user_uuid,
             atype: atype as i32,
             enabled: true,
@@ -51,17 +55,17 @@ impl TwoFactor {
 
     pub fn to_json(&self) -> Value {
         json!({
-            "Enabled": self.enabled,
-            "Key": "", // This key and value vary
-            "Object": "twoFactorAuthenticator" // This value varies
+            "enabled": self.enabled,
+            "key": "", // This key and value vary
+            "Oobject": "twoFactorAuthenticator" // This value varies
         })
     }
 
     pub fn to_json_provider(&self) -> Value {
         json!({
-            "Enabled": self.enabled,
-            "Type": self.atype,
-            "Object": "twoFactorProvider"
+            "enabled": self.enabled,
+            "type": self.atype,
+            "object": "twoFactorProvider"
         })
     }
 }
@@ -92,7 +96,7 @@ impl TwoFactor {
                 // We need to make sure we're not going to violate the unique constraint on user_uuid and atype.
                 // This happens automatically on other DBMS backends due to replace_into(). PostgreSQL does
                 // not support multiple constraints on ON CONFLICT clauses.
-                diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(&self.user_uuid)).filter(twofactor::atype.eq(&self.atype)))
+                let _: () = diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(&self.user_uuid)).filter(twofactor::atype.eq(&self.atype)))
                     .execute(conn)
                     .map_res("Error deleting twofactor for insert")?;
 
@@ -115,7 +119,7 @@ impl TwoFactor {
         }}
     }
 
-    pub async fn find_by_user(user_uuid: &str, conn: &mut DbConn) -> Vec<Self> {
+    pub async fn find_by_user(user_uuid: &UserId, conn: &mut DbConn) -> Vec<Self> {
         db_run! { conn: {
             twofactor::table
                 .filter(twofactor::user_uuid.eq(user_uuid))
@@ -126,7 +130,7 @@ impl TwoFactor {
         }}
     }
 
-    pub async fn find_by_user_and_type(user_uuid: &str, atype: i32, conn: &mut DbConn) -> Option<Self> {
+    pub async fn find_by_user_and_type(user_uuid: &UserId, atype: i32, conn: &mut DbConn) -> Option<Self> {
         db_run! { conn: {
             twofactor::table
                 .filter(twofactor::user_uuid.eq(user_uuid))
@@ -137,7 +141,7 @@ impl TwoFactor {
         }}
     }
 
-    pub async fn delete_all_by_user(user_uuid: &str, conn: &mut DbConn) -> EmptyResult {
+    pub async fn delete_all_by_user(user_uuid: &UserId, conn: &mut DbConn) -> EmptyResult {
         db_run! { conn: {
             diesel::delete(twofactor::table.filter(twofactor::user_uuid.eq(user_uuid)))
                 .execute(conn)
@@ -214,3 +218,6 @@ impl TwoFactor {
         Ok(())
     }
 }
+
+#[derive(Clone, Debug, DieselNewType, FromForm, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TwoFactorId(String);

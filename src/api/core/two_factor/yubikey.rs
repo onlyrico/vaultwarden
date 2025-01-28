@@ -1,14 +1,14 @@
 use rocket::serde::json::Json;
 use rocket::Route;
 use serde_json::Value;
-use yubico::{config::Config, verify};
+use yubico::{config::Config, verify_async};
 
 use crate::{
     api::{
         core::{log_user_event, two_factor::_generate_recover_code},
-        EmptyResult, JsonResult, JsonUpcase, PasswordData,
+        EmptyResult, JsonResult, PasswordOrOtpData,
     },
-    auth::{ClientIp, Headers},
+    auth::Headers,
     db::{
         models::{EventType, TwoFactor, TwoFactorType},
         DbConn,
@@ -21,33 +21,36 @@ pub fn routes() -> Vec<Route> {
     routes![generate_yubikey, activate_yubikey, activate_yubikey_put,]
 }
 
-#[derive(Deserialize, Debug)]
-#[allow(non_snake_case)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EnableYubikeyData {
-    MasterPasswordHash: String,
-    Key1: Option<String>,
-    Key2: Option<String>,
-    Key3: Option<String>,
-    Key4: Option<String>,
-    Key5: Option<String>,
-    Nfc: bool,
+    key1: Option<String>,
+    key2: Option<String>,
+    key3: Option<String>,
+    key4: Option<String>,
+    key5: Option<String>,
+    nfc: bool,
+    master_password_hash: Option<String>,
+    otp: Option<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug)]
-#[allow(non_snake_case)]
+#[serde(rename_all = "camelCase")]
 pub struct YubikeyMetadata {
-    Keys: Vec<String>,
-    pub Nfc: bool,
+    #[serde(rename = "keys", alias = "Keys")]
+    keys: Vec<String>,
+    #[serde(rename = "nfc", alias = "Nfc")]
+    pub nfc: bool,
 }
 
 fn parse_yubikeys(data: &EnableYubikeyData) -> Vec<String> {
-    let data_keys = [&data.Key1, &data.Key2, &data.Key3, &data.Key4, &data.Key5];
+    let data_keys = [&data.key1, &data.key2, &data.key3, &data.key4, &data.key5];
 
     data_keys.iter().filter_map(|e| e.as_ref().cloned()).collect()
 }
 
-fn jsonify_yubikeys(yubikeys: Vec<String>) -> serde_json::Value {
-    let mut result = json!({});
+fn jsonify_yubikeys(yubikeys: Vec<String>) -> Value {
+    let mut result = Value::Object(serde_json::Map::new());
 
     for (i, key) in yubikeys.into_iter().enumerate() {
         result[format!("Key{}", i + 1)] = Value::String(key);
@@ -73,63 +76,56 @@ async fn verify_yubikey_otp(otp: String) -> EmptyResult {
     let config = Config::default().set_client_id(yubico_id).set_key(yubico_secret);
 
     match CONFIG.yubico_server() {
-        Some(server) => {
-            tokio::task::spawn_blocking(move || verify(otp, config.set_api_hosts(vec![server]))).await.unwrap()
-        }
-        None => tokio::task::spawn_blocking(move || verify(otp, config)).await.unwrap(),
+        Some(server) => verify_async(otp, config.set_api_hosts(vec![server])).await,
+        None => verify_async(otp, config).await,
     }
     .map_res("Failed to verify OTP")
-    .and(Ok(()))
 }
 
 #[post("/two-factor/get-yubikey", data = "<data>")]
-async fn generate_yubikey(data: JsonUpcase<PasswordData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+async fn generate_yubikey(data: Json<PasswordOrOtpData>, headers: Headers, mut conn: DbConn) -> JsonResult {
     // Make sure the credentials are set
     get_yubico_credentials()?;
 
-    let data: PasswordData = data.into_inner().data;
+    let data: PasswordOrOtpData = data.into_inner();
     let user = headers.user;
 
-    if !user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password");
-    }
+    data.validate(&user, false, &mut conn).await?;
 
-    let user_uuid = &user.uuid;
+    let user_id = &user.uuid;
     let yubikey_type = TwoFactorType::YubiKey as i32;
 
-    let r = TwoFactor::find_by_user_and_type(user_uuid, yubikey_type, &mut conn).await;
+    let r = TwoFactor::find_by_user_and_type(user_id, yubikey_type, &mut conn).await;
 
     if let Some(r) = r {
         let yubikey_metadata: YubikeyMetadata = serde_json::from_str(&r.data)?;
 
-        let mut result = jsonify_yubikeys(yubikey_metadata.Keys);
+        let mut result = jsonify_yubikeys(yubikey_metadata.keys);
 
-        result["Enabled"] = Value::Bool(true);
-        result["Nfc"] = Value::Bool(yubikey_metadata.Nfc);
-        result["Object"] = Value::String("twoFactorU2f".to_owned());
+        result["enabled"] = Value::Bool(true);
+        result["nfc"] = Value::Bool(yubikey_metadata.nfc);
+        result["object"] = Value::String("twoFactorU2f".to_owned());
 
         Ok(Json(result))
     } else {
         Ok(Json(json!({
-            "Enabled": false,
-            "Object": "twoFactorU2f",
+            "enabled": false,
+            "object": "twoFactorU2f",
         })))
     }
 }
 
 #[post("/two-factor/yubikey", data = "<data>")]
-async fn activate_yubikey(
-    data: JsonUpcase<EnableYubikeyData>,
-    headers: Headers,
-    mut conn: DbConn,
-    ip: ClientIp,
-) -> JsonResult {
-    let data: EnableYubikeyData = data.into_inner().data;
+async fn activate_yubikey(data: Json<EnableYubikeyData>, headers: Headers, mut conn: DbConn) -> JsonResult {
+    let data: EnableYubikeyData = data.into_inner();
     let mut user = headers.user;
 
-    if !user.check_valid_password(&data.MasterPasswordHash) {
-        err!("Invalid password");
+    PasswordOrOtpData {
+        master_password_hash: data.master_password_hash.clone(),
+        otp: data.otp.clone(),
     }
+    .validate(&user, true, &mut conn)
+    .await?;
 
     // Check if we already have some data
     let mut yubikey_data =
@@ -142,8 +138,8 @@ async fn activate_yubikey(
 
     if yubikeys.is_empty() {
         return Ok(Json(json!({
-            "Enabled": false,
-            "Object": "twoFactorU2f",
+            "enabled": false,
+            "object": "twoFactorU2f",
         })));
     }
 
@@ -160,8 +156,8 @@ async fn activate_yubikey(
     let yubikey_ids: Vec<String> = yubikeys.into_iter().map(|x| (x[..12]).to_owned()).collect();
 
     let yubikey_metadata = YubikeyMetadata {
-        Keys: yubikey_ids,
-        Nfc: data.Nfc,
+        keys: yubikey_ids,
+        nfc: data.nfc,
     };
 
     yubikey_data.data = serde_json::to_string(&yubikey_metadata).unwrap();
@@ -169,25 +165,20 @@ async fn activate_yubikey(
 
     _generate_recover_code(&mut user, &mut conn).await;
 
-    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &ip.ip, &mut conn).await;
+    log_user_event(EventType::UserUpdated2fa as i32, &user.uuid, headers.device.atype, &headers.ip.ip, &mut conn).await;
 
-    let mut result = jsonify_yubikeys(yubikey_metadata.Keys);
+    let mut result = jsonify_yubikeys(yubikey_metadata.keys);
 
-    result["Enabled"] = Value::Bool(true);
-    result["Nfc"] = Value::Bool(yubikey_metadata.Nfc);
-    result["Object"] = Value::String("twoFactorU2f".to_owned());
+    result["enabled"] = Value::Bool(true);
+    result["nfc"] = Value::Bool(yubikey_metadata.nfc);
+    result["object"] = Value::String("twoFactorU2f".to_owned());
 
     Ok(Json(result))
 }
 
 #[put("/two-factor/yubikey", data = "<data>")]
-async fn activate_yubikey_put(
-    data: JsonUpcase<EnableYubikeyData>,
-    headers: Headers,
-    conn: DbConn,
-    ip: ClientIp,
-) -> JsonResult {
-    activate_yubikey(data, headers, conn, ip).await
+async fn activate_yubikey_put(data: Json<EnableYubikeyData>, headers: Headers, conn: DbConn) -> JsonResult {
+    activate_yubikey(data, headers, conn).await
 }
 
 pub async fn validate_yubikey_login(response: &str, twofactor_data: &str) -> EmptyResult {
@@ -198,14 +189,10 @@ pub async fn validate_yubikey_login(response: &str, twofactor_data: &str) -> Emp
     let yubikey_metadata: YubikeyMetadata = serde_json::from_str(twofactor_data).expect("Can't parse Yubikey Metadata");
     let response_id = &response[..12];
 
-    if !yubikey_metadata.Keys.contains(&response_id.to_owned()) {
+    if !yubikey_metadata.keys.contains(&response_id.to_owned()) {
         err!("Given Yubikey is not registered");
     }
 
-    let result = verify_yubikey_otp(response.to_owned()).await;
-
-    match result {
-        Ok(_answer) => Ok(()),
-        Err(_e) => err!("Failed to verify Yubikey against OTP server"),
-    }
+    verify_yubikey_otp(response.to_owned()).await.map_res("Failed to verify Yubikey against OTP server")?;
+    Ok(())
 }

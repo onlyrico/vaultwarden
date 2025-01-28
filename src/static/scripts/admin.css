@@ -25,7 +25,7 @@ img {
     min-width: 85px;
     max-width: 85px;
 }
-#users-table .vw-ciphers, #orgs-table .vw-users, #orgs-table .vw-ciphers {
+#users-table .vw-entries, #orgs-table .vw-users, #orgs-table .vw-entries {
     min-width: 35px;
     max-width: 40px;
 }
@@ -38,8 +38,8 @@ img {
     max-width: 130px;
 }
 #users-table .vw-actions, #orgs-table .vw-actions {
-    min-width: 130px;
-    max-width: 130px;
+    min-width: 135px;
+    max-width: 140px;
 }
 #users-table .vw-org-cell {
     max-height: 120px;

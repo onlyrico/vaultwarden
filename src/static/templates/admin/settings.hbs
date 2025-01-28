@@ -1,4 +1,10 @@
 <main class="container-xl">
+    <div id="admin_token_warning" class="alert alert-warning alert-dismissible fade show d-none">
+        <button type="button" class="btn-close" data-bs-target="admin_token_warning" data-bs-dismiss="alert" aria-label="Close"></button>
+        You are using a plain text `ADMIN_TOKEN` which is insecure.<br>
+        Please generate a secure Argon2 PHC string by using `vaultwarden hash` or `argon2`.<br>
+        See: <a href="https://github.com/dani-garcia/vaultwarden/wiki/Enabling-admin-page#secure-the-admin_token" target="_blank" rel="noopener noreferrer">Enabling admin page - Secure the `ADMIN_TOKEN`</a>
+    </div>
     <div id="config-block" class="align-items-center p-3 mb-3 bg-secondary rounded shadow">
         <div>
             <h6 class="text-white mb-3">Configuration</h6>
@@ -11,7 +17,7 @@
             <form class="form needs-validation" id="config-form" novalidate>
                 {{#each page_data.config}}
                 {{#if groupdoc}}
-                <div class="card bg-light mb-3">
+                <div class="card mb-3">
                     <button id="b_{{group}}" type="button" class="card-header text-start btn btn-link text-decoration-none" aria-expanded="false" aria-controls="g_{{group}}" data-bs-toggle="collapse" data-bs-target="#g_{{group}}">{{groupdoc}}</button>
                     <div id="g_{{group}}" class="card-body collapse">
                         {{#each elements}}
@@ -58,7 +64,7 @@
                 {{/if}}
                 {{/each}}
 
-                <div class="card bg-light mb-3">
+                <div class="card mb-3">
                     <button id="b_readonly" type="button" class="card-header text-start btn btn-link text-decoration-none" aria-expanded="false" aria-controls="g_readonly"
                             data-bs-toggle="collapse" data-bs-target="#g_readonly">Read-Only Config</button>
                     <div id="g_readonly" class="card-body collapse">
@@ -113,7 +119,7 @@
                 </div>
 
                 {{#if page_data.can_backup}}
-                <div class="card bg-light mb-3">
+                <div class="card mb-3">
                     <button id="b_database" type="button" class="card-header text-start btn btn-link text-decoration-none" aria-expanded="false" aria-controls="g_database"
                             data-bs-toggle="collapse" data-bs-target="#g_database">Backup Database</button>
                     <div id="g_database" class="card-body collapse">

@@ -7,7 +7,6 @@ use diesel::{
 
 use rocket::{
     http::Status,
-    outcome::IntoOutcome,
     request::{FromRequest, Outcome},
     Request,
 };
@@ -301,19 +300,17 @@ pub trait FromDb {
 
 impl<T: FromDb> FromDb for Vec<T> {
     type Output = Vec<T::Output>;
-    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn from_db(self) -> Self::Output {
-        self.into_iter().map(crate::db::FromDb::from_db).collect()
+        self.into_iter().map(FromDb::from_db).collect()
     }
 }
 
 impl<T: FromDb> FromDb for Option<T> {
     type Output = Option<T::Output>;
-    #[allow(clippy::wrong_self_convention)]
     #[inline(always)]
     fn from_db(self) -> Self::Output {
-        self.map(crate::db::FromDb::from_db)
+        self.map(FromDb::from_db)
     }
 }
 
@@ -369,19 +366,21 @@ pub mod models;
 
 /// Creates a back-up of the sqlite database
 /// MySQL/MariaDB and PostgreSQL are not supported.
-pub async fn backup_database(conn: &mut DbConn) -> Result<(), Error> {
+pub async fn backup_database(conn: &mut DbConn) -> Result<String, Error> {
     db_run! {@raw conn:
         postgresql, mysql {
             let _ = conn;
             err!("PostgreSQL and MySQL/MariaDB do not support this backup feature");
         }
         sqlite {
-            use std::path::Path;
             let db_url = CONFIG.database_url();
-            let db_path = Path::new(&db_url).parent().unwrap().to_string_lossy();
-            let file_date = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-            diesel::sql_query(format!("VACUUM INTO '{db_path}/db_{file_date}.sqlite3'")).execute(conn)?;
-            Ok(())
+            let db_path = std::path::Path::new(&db_url).parent().unwrap();
+            let backup_file = db_path
+                .join(format!("db_{}.sqlite3", chrono::Utc::now().format("%Y%m%d_%H%M%S")))
+                .to_string_lossy()
+                .into_owned();
+            diesel::sql_query(format!("VACUUM INTO '{backup_file}'")).execute(conn)?;
+            Ok(backup_file)
         }
     }
 }
@@ -390,13 +389,13 @@ pub async fn backup_database(conn: &mut DbConn) -> Result<(), Error> {
 pub async fn get_sql_server_version(conn: &mut DbConn) -> String {
     db_run! {@raw conn:
         postgresql, mysql {
-            sql_function!{
+            define_sql_function!{
                 fn version() -> diesel::sql_types::Text;
             }
             diesel::select(version()).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
         }
         sqlite {
-            sql_function!{
+            define_sql_function!{
                 fn sqlite_version() -> diesel::sql_types::Text;
             }
             diesel::select(sqlite_version()).get_result::<String>(conn).unwrap_or_else(|_| "Unknown".to_string())
@@ -413,8 +412,11 @@ impl<'r> FromRequest<'r> for DbConn {
 
     async fn from_request(request: &'r Request<'_>) -> Outcome<Self, Self::Error> {
         match request.rocket().state::<DbPool>() {
-            Some(p) => p.get().await.map_err(|_| ()).into_outcome(Status::ServiceUnavailable),
-            None => Outcome::Failure((Status::InternalServerError, ())),
+            Some(p) => match p.get().await {
+                Ok(dbconn) => Outcome::Success(dbconn),
+                _ => Outcome::Error((Status::ServiceUnavailable, ())),
+            },
+            None => Outcome::Error((Status::InternalServerError, ())),
         }
     }
 }
@@ -479,21 +481,9 @@ mod postgresql_migrations {
     pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations/postgresql");
 
     pub fn run_migrations() -> Result<(), super::Error> {
-        use diesel::{Connection, RunQueryDsl};
+        use diesel::Connection;
         // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
         let mut connection = diesel::pg::PgConnection::establish(&crate::CONFIG.database_url())?;
-        // Disable Foreign Key Checks during migration
-
-        // FIXME: Per https://www.postgresql.org/docs/12/sql-set-constraints.html,
-        // "SET CONSTRAINTS sets the behavior of constraint checking within the
-        // current transaction", so this setting probably won't take effect for
-        // any of the migrations since it's being run outside of a transaction.
-        // Migrations that need to disable foreign key checks should run this
-        // from within the migration script itself.
-        diesel::sql_query("SET CONSTRAINTS ALL DEFERRED")
-            .execute(&mut connection)
-            .expect("Failed to disable Foreign Key Checks during migrations");
-
         connection.run_pending_migrations(MIGRATIONS).expect("Error running migrations");
         Ok(())
     }

@@ -1,77 +1,256 @@
-use std::{
-    net::SocketAddr,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::Duration,
-};
+use std::{net::IpAddr, sync::Arc, time::Duration};
 
-use chrono::NaiveDateTime;
-use futures::{SinkExt, StreamExt};
+use chrono::{NaiveDateTime, Utc};
 use rmpv::Value;
-use rocket::{serde::json::Json, Route};
-use serde_json::Value as JsonValue;
-use tokio::{
-    net::{TcpListener, TcpStream},
-    sync::mpsc::Sender,
-};
-use tokio_tungstenite::{
-    accept_hdr_async,
-    tungstenite::{handshake, Message},
-};
+use rocket::{futures::StreamExt, Route};
+use tokio::sync::mpsc::Sender;
+
+use rocket_ws::{Message, WebSocket};
 
 use crate::{
-    api::EmptyResult,
-    auth::Headers,
-    db::models::{Cipher, Folder, Send, User},
+    auth::{ClientIp, WsAccessTokenHeader},
+    db::{
+        models::{AuthRequestId, Cipher, CollectionId, DeviceId, Folder, Send as DbSend, User, UserId},
+        DbConn,
+    },
     Error, CONFIG,
 };
 
+use once_cell::sync::Lazy;
+
+pub static WS_USERS: Lazy<Arc<WebSocketUsers>> = Lazy::new(|| {
+    Arc::new(WebSocketUsers {
+        map: Arc::new(dashmap::DashMap::new()),
+    })
+});
+
+pub static WS_ANONYMOUS_SUBSCRIPTIONS: Lazy<Arc<AnonymousWebSocketSubscriptions>> = Lazy::new(|| {
+    Arc::new(AnonymousWebSocketSubscriptions {
+        map: Arc::new(dashmap::DashMap::new()),
+    })
+});
+
+use super::{
+    push::push_auth_request, push::push_auth_response, push_cipher_update, push_folder_update, push_logout,
+    push_send_update, push_user_update,
+};
+
+static NOTIFICATIONS_DISABLED: Lazy<bool> = Lazy::new(|| !CONFIG.enable_websocket() && !CONFIG.push_enabled());
+
 pub fn routes() -> Vec<Route> {
-    routes![negotiate, websockets_err]
-}
-
-#[get("/hub")]
-fn websockets_err() -> EmptyResult {
-    static SHOW_WEBSOCKETS_MSG: AtomicBool = AtomicBool::new(true);
-
-    if CONFIG.websocket_enabled()
-        && SHOW_WEBSOCKETS_MSG.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_ok()
-    {
-        err!(
-            "
-    ###########################################################
-    '/notifications/hub' should be proxied to the websocket server or notifications won't work.
-    Go to the Wiki for more info, or disable WebSockets setting WEBSOCKET_ENABLED=false.
-    ###########################################################################################\n"
-        )
+    if CONFIG.enable_websocket() {
+        routes![websockets_hub, anonymous_websockets_hub]
     } else {
-        Err(Error::empty())
+        info!("WebSocket are disabled, realtime sync functionality will not work!");
+        routes![]
     }
 }
 
-#[post("/hub/negotiate")]
-fn negotiate(_headers: Headers) -> Json<JsonValue> {
-    use crate::crypto;
-    use data_encoding::BASE64URL;
+#[derive(FromForm, Debug)]
+struct WsAccessToken {
+    access_token: Option<String>,
+}
 
-    let conn_id = crypto::encode_random_bytes::<16>(BASE64URL);
-    let mut available_transports: Vec<JsonValue> = Vec::new();
+struct WSEntryMapGuard {
+    users: Arc<WebSocketUsers>,
+    user_uuid: UserId,
+    entry_uuid: uuid::Uuid,
+    addr: IpAddr,
+}
 
-    if CONFIG.websocket_enabled() {
-        available_transports.push(json!({"transport":"WebSockets", "transferFormats":["Text","Binary"]}));
+impl WSEntryMapGuard {
+    fn new(users: Arc<WebSocketUsers>, user_uuid: UserId, entry_uuid: uuid::Uuid, addr: IpAddr) -> Self {
+        Self {
+            users,
+            user_uuid,
+            entry_uuid,
+            addr,
+        }
     }
+}
 
-    // TODO: Implement transports
-    // Rocket WS support: https://github.com/SergioBenitez/Rocket/issues/90
-    // Rocket SSE support: https://github.com/SergioBenitez/Rocket/issues/33
-    // {"transport":"ServerSentEvents", "transferFormats":["Text"]},
-    // {"transport":"LongPolling", "transferFormats":["Text","Binary"]}
-    Json(json!({
-        "connectionId": conn_id,
-        "availableTransports": available_transports
-    }))
+impl Drop for WSEntryMapGuard {
+    fn drop(&mut self) {
+        info!("Closing WS connection from {}", self.addr);
+        if let Some(mut entry) = self.users.map.get_mut(self.user_uuid.as_ref()) {
+            entry.retain(|(uuid, _)| uuid != &self.entry_uuid);
+        }
+    }
+}
+
+struct WSAnonymousEntryMapGuard {
+    subscriptions: Arc<AnonymousWebSocketSubscriptions>,
+    token: String,
+    addr: IpAddr,
+}
+
+impl WSAnonymousEntryMapGuard {
+    fn new(subscriptions: Arc<AnonymousWebSocketSubscriptions>, token: String, addr: IpAddr) -> Self {
+        Self {
+            subscriptions,
+            token,
+            addr,
+        }
+    }
+}
+
+impl Drop for WSAnonymousEntryMapGuard {
+    fn drop(&mut self) {
+        info!("Closing WS connection from {}", self.addr);
+        self.subscriptions.map.remove(&self.token);
+    }
+}
+
+#[allow(tail_expr_drop_order)]
+#[get("/hub?<data..>")]
+fn websockets_hub<'r>(
+    ws: WebSocket,
+    data: WsAccessToken,
+    ip: ClientIp,
+    header_token: WsAccessTokenHeader,
+) -> Result<rocket_ws::Stream!['r], Error> {
+    let addr = ip.ip;
+    info!("Accepting Rocket WS connection from {addr}");
+
+    let token = if let Some(token) = data.access_token {
+        token
+    } else if let Some(token) = header_token.access_token {
+        token
+    } else {
+        err_code!("Invalid claim", 401)
+    };
+
+    let Ok(claims) = crate::auth::decode_login(&token) else {
+        err_code!("Invalid token", 401)
+    };
+
+    let (mut rx, guard) = {
+        let users = Arc::clone(&WS_USERS);
+
+        // Add a channel to send messages to this client to the map
+        let entry_uuid = uuid::Uuid::new_v4();
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        users.map.entry(claims.sub.to_string()).or_default().push((entry_uuid, tx));
+
+        // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
+        (rx, WSEntryMapGuard::new(users, claims.sub, entry_uuid, addr))
+    };
+
+    Ok({
+        rocket_ws::Stream! { ws => {
+            let mut ws = ws;
+            let _guard = guard;
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    res = ws.next() =>  {
+                        match res {
+                            Some(Ok(message)) => {
+                                match message {
+                                    // Respond to any pings
+                                    Message::Ping(ping) => yield Message::Pong(ping),
+                                    Message::Pong(_) => {/* Ignored */},
+
+                                    // We should receive an initial message with the protocol and version, and we will reply to it
+                                    Message::Text(ref message) => {
+                                        let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
+
+                                        if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
+                                            yield Message::binary(INITIAL_RESPONSE);
+                                        }
+                                    }
+
+                                    // Prevent sending anything back when a `Close` Message is received.
+                                    // Just break the loop
+                                    Message::Close(_) => break,
+
+                                    // Just echo anything else the client sends
+                                    _ => yield message,
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    res = rx.recv() => {
+                        match res {
+                            Some(res) => yield res,
+                            None => break,
+                        }
+                    }
+
+                    _ = interval.tick() => yield Message::Ping(create_ping())
+                }
+            }
+        }}
+    })
+}
+
+#[allow(tail_expr_drop_order)]
+#[get("/anonymous-hub?<token..>")]
+fn anonymous_websockets_hub<'r>(ws: WebSocket, token: String, ip: ClientIp) -> Result<rocket_ws::Stream!['r], Error> {
+    let addr = ip.ip;
+    info!("Accepting Anonymous Rocket WS connection from {addr}");
+
+    let (mut rx, guard) = {
+        let subscriptions = Arc::clone(&WS_ANONYMOUS_SUBSCRIPTIONS);
+
+        // Add a channel to send messages to this client to the map
+        let (tx, rx) = tokio::sync::mpsc::channel::<Message>(100);
+        subscriptions.map.insert(token.clone(), tx);
+
+        // Once the guard goes out of scope, the connection will have been closed and the entry will be deleted from the map
+        (rx, WSAnonymousEntryMapGuard::new(subscriptions, token, addr))
+    };
+
+    Ok({
+        rocket_ws::Stream! { ws => {
+            let mut ws = ws;
+            let _guard = guard;
+            let mut interval = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    res = ws.next() =>  {
+                        match res {
+                            Some(Ok(message)) => {
+                                match message {
+                                    // Respond to any pings
+                                    Message::Ping(ping) => yield Message::Pong(ping),
+                                    Message::Pong(_) => {/* Ignored */},
+
+                                    // We should receive an initial message with the protocol and version, and we will reply to it
+                                    Message::Text(ref message) => {
+                                        let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
+
+                                        if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
+                                            yield Message::binary(INITIAL_RESPONSE);
+                                        }
+                                    }
+
+                                    // Prevent sending anything back when a `Close` Message is received.
+                                    // Just break the loop
+                                    Message::Close(_) => break,
+
+                                    // Just echo anything else the client sends
+                                    _ => yield message,
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    res = rx.recv() => {
+                        match res {
+                            Some(res) => yield res,
+                            None => break,
+                        }
+                    }
+
+                    _ = interval.tick() => yield Message::Ping(create_ping())
+                }
+            }
+        }}
+    })
 }
 
 //
@@ -109,9 +288,9 @@ fn serialize(val: Value) -> Vec<u8> {
 }
 
 fn serialize_date(date: NaiveDateTime) -> Value {
-    let seconds: i64 = date.timestamp();
-    let nanos: i64 = date.timestamp_subsec_nanos().into();
-    let timestamp = nanos << 34 | seconds;
+    let seconds: i64 = date.and_utc().timestamp();
+    let nanos: i64 = date.and_utc().timestamp_subsec_nanos().into();
+    let timestamp = (nanos << 34) | seconds;
 
     let bs = timestamp.to_be_bytes();
 
@@ -149,11 +328,11 @@ pub struct WebSocketUsers {
 }
 
 impl WebSocketUsers {
-    async fn send_update(&self, user_uuid: &str, data: &[u8]) {
-        if let Some(user) = self.map.get(user_uuid).map(|v| v.clone()) {
+    async fn send_update(&self, user_id: &UserId, data: &[u8]) {
+        if let Some(user) = self.map.get(user_id.as_ref()).map(|v| v.clone()) {
             for (_, sender) in user.iter() {
-                if sender.send(Message::binary(data)).await.is_err() {
-                    // TODO: Delete from map here too?
+                if let Err(e) = sender.send(Message::binary(data)).await {
+                    error!("Error sending WS update {e}");
                 }
             }
         }
@@ -161,82 +340,233 @@ impl WebSocketUsers {
 
     // NOTE: The last modified date needs to be updated before calling these methods
     pub async fn send_user_update(&self, ut: UpdateType, user: &User) {
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
         let data = create_update(
-            vec![("UserId".into(), user.uuid.clone().into()), ("Date".into(), serialize_date(user.updated_at))],
+            vec![("UserId".into(), user.uuid.to_string().into()), ("Date".into(), serialize_date(user.updated_at))],
             ut,
             None,
         );
 
-        self.send_update(&user.uuid, &data).await;
+        if CONFIG.enable_websocket() {
+            self.send_update(&user.uuid, &data).await;
+        }
+
+        if CONFIG.push_enabled() {
+            push_user_update(ut, user);
+        }
     }
 
-    pub async fn send_logout(&self, user: &User, acting_device_uuid: Option<String>) {
+    pub async fn send_logout(&self, user: &User, acting_device_id: Option<DeviceId>) {
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
         let data = create_update(
-            vec![("UserId".into(), user.uuid.clone().into()), ("Date".into(), serialize_date(user.updated_at))],
+            vec![("UserId".into(), user.uuid.to_string().into()), ("Date".into(), serialize_date(user.updated_at))],
             UpdateType::LogOut,
-            acting_device_uuid,
+            acting_device_id.clone(),
         );
 
-        self.send_update(&user.uuid, &data).await;
+        if CONFIG.enable_websocket() {
+            self.send_update(&user.uuid, &data).await;
+        }
+
+        if CONFIG.push_enabled() {
+            push_logout(user, acting_device_id.clone());
+        }
     }
 
-    pub async fn send_folder_update(&self, ut: UpdateType, folder: &Folder, acting_device_uuid: &String) {
+    pub async fn send_folder_update(
+        &self,
+        ut: UpdateType,
+        folder: &Folder,
+        acting_device_id: &DeviceId,
+        conn: &mut DbConn,
+    ) {
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
         let data = create_update(
             vec![
-                ("Id".into(), folder.uuid.clone().into()),
-                ("UserId".into(), folder.user_uuid.clone().into()),
+                ("Id".into(), folder.uuid.to_string().into()),
+                ("UserId".into(), folder.user_uuid.to_string().into()),
                 ("RevisionDate".into(), serialize_date(folder.updated_at)),
             ],
             ut,
-            Some(acting_device_uuid.into()),
+            Some(acting_device_id.clone()),
         );
 
-        self.send_update(&folder.user_uuid, &data).await;
+        if CONFIG.enable_websocket() {
+            self.send_update(&folder.user_uuid, &data).await;
+        }
+
+        if CONFIG.push_enabled() {
+            push_folder_update(ut, folder, acting_device_id, conn).await;
+        }
     }
 
     pub async fn send_cipher_update(
         &self,
         ut: UpdateType,
         cipher: &Cipher,
-        user_uuids: &[String],
-        acting_device_uuid: &String,
+        user_ids: &[UserId],
+        acting_device_id: &DeviceId,
+        collection_uuids: Option<Vec<CollectionId>>,
+        conn: &mut DbConn,
     ) {
-        let user_uuid = convert_option(cipher.user_uuid.clone());
-        let org_uuid = convert_option(cipher.organization_uuid.clone());
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
+        let org_id = convert_option(cipher.organization_uuid.as_deref());
+        // Depending if there are collections provided or not, we need to have different values for the following variables.
+        // The user_uuid should be `null`, and the revision date should be set to now, else the clients won't sync the collection change.
+        let (user_id, collection_uuids, revision_date) = if let Some(collection_uuids) = collection_uuids {
+            (
+                Value::Nil,
+                Value::Array(collection_uuids.into_iter().map(|v| v.to_string().into()).collect::<Vec<Value>>()),
+                serialize_date(Utc::now().naive_utc()),
+            )
+        } else {
+            (convert_option(cipher.user_uuid.as_deref()), Value::Nil, serialize_date(cipher.updated_at))
+        };
 
         let data = create_update(
             vec![
-                ("Id".into(), cipher.uuid.clone().into()),
-                ("UserId".into(), user_uuid),
-                ("OrganizationId".into(), org_uuid),
-                ("CollectionIds".into(), Value::Nil),
-                ("RevisionDate".into(), serialize_date(cipher.updated_at)),
+                ("Id".into(), cipher.uuid.to_string().into()),
+                ("UserId".into(), user_id),
+                ("OrganizationId".into(), org_id),
+                ("CollectionIds".into(), collection_uuids),
+                ("RevisionDate".into(), revision_date),
             ],
             ut,
-            Some(acting_device_uuid.into()),
+            Some(acting_device_id.clone()),
         );
 
-        for uuid in user_uuids {
-            self.send_update(uuid, &data).await;
+        if CONFIG.enable_websocket() {
+            for uuid in user_ids {
+                self.send_update(uuid, &data).await;
+            }
+        }
+
+        if CONFIG.push_enabled() && user_ids.len() == 1 {
+            push_cipher_update(ut, cipher, acting_device_id, conn).await;
         }
     }
 
-    pub async fn send_send_update(&self, ut: UpdateType, send: &Send, user_uuids: &[String]) {
-        let user_uuid = convert_option(send.user_uuid.clone());
+    pub async fn send_send_update(
+        &self,
+        ut: UpdateType,
+        send: &DbSend,
+        user_ids: &[UserId],
+        acting_device_id: &DeviceId,
+        conn: &mut DbConn,
+    ) {
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
+        let user_id = convert_option(send.user_uuid.as_deref());
 
         let data = create_update(
             vec![
-                ("Id".into(), send.uuid.clone().into()),
-                ("UserId".into(), user_uuid),
+                ("Id".into(), send.uuid.to_string().into()),
+                ("UserId".into(), user_id),
                 ("RevisionDate".into(), serialize_date(send.revision_date)),
             ],
             ut,
             None,
         );
 
-        for uuid in user_uuids {
-            self.send_update(uuid, &data).await;
+        if CONFIG.enable_websocket() {
+            for uuid in user_ids {
+                self.send_update(uuid, &data).await;
+            }
         }
+        if CONFIG.push_enabled() && user_ids.len() == 1 {
+            push_send_update(ut, send, acting_device_id, conn).await;
+        }
+    }
+
+    pub async fn send_auth_request(
+        &self,
+        user_id: &UserId,
+        auth_request_uuid: &String,
+        acting_device_id: &DeviceId,
+        conn: &mut DbConn,
+    ) {
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
+        let data = create_update(
+            vec![("Id".into(), auth_request_uuid.clone().into()), ("UserId".into(), user_id.to_string().into())],
+            UpdateType::AuthRequest,
+            Some(acting_device_id.clone()),
+        );
+        if CONFIG.enable_websocket() {
+            self.send_update(user_id, &data).await;
+        }
+
+        if CONFIG.push_enabled() {
+            push_auth_request(user_id.clone(), auth_request_uuid.to_string(), conn).await;
+        }
+    }
+
+    pub async fn send_auth_response(
+        &self,
+        user_id: &UserId,
+        auth_request_id: &AuthRequestId,
+        approving_device_id: &DeviceId,
+        conn: &mut DbConn,
+    ) {
+        // Skip any processing if both WebSockets and Push are not active
+        if *NOTIFICATIONS_DISABLED {
+            return;
+        }
+        let data = create_update(
+            vec![("Id".into(), auth_request_id.to_string().into()), ("UserId".into(), user_id.to_string().into())],
+            UpdateType::AuthRequestResponse,
+            Some(approving_device_id.clone()),
+        );
+        if CONFIG.enable_websocket() {
+            self.send_update(user_id, &data).await;
+        }
+
+        if CONFIG.push_enabled() {
+            push_auth_response(user_id, auth_request_id, approving_device_id, conn).await;
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AnonymousWebSocketSubscriptions {
+    map: Arc<dashmap::DashMap<String, Sender<Message>>>,
+}
+
+impl AnonymousWebSocketSubscriptions {
+    async fn send_update(&self, token: &str, data: &[u8]) {
+        if let Some(sender) = self.map.get(token).map(|v| v.clone()) {
+            if let Err(e) = sender.send(Message::binary(data)).await {
+                error!("Error sending WS update {e}");
+            }
+        }
+    }
+
+    pub async fn send_auth_response(&self, user_id: &UserId, auth_request_id: &AuthRequestId) {
+        if !CONFIG.enable_websocket() {
+            return;
+        }
+        let data = create_anonymous_update(
+            vec![("Id".into(), auth_request_id.to_string().into()), ("UserId".into(), user_id.to_string().into())],
+            UpdateType::AuthRequestResponse,
+            user_id.clone(),
+        );
+        self.send_update(auth_request_id, &data).await;
     }
 }
 
@@ -248,14 +578,14 @@ impl WebSocketUsers {
     "ReceiveMessage", // Target
     [ // Arguments
         {
-            "ContextId": acting_device_uuid || Nil,
+            "ContextId": acting_device_id || Nil,
             "Type": ut as i32,
             "Payload": {}
         }
     ]
 ]
 */
-fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType, acting_device_uuid: Option<String>) -> Vec<u8> {
+fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType, acting_device_id: Option<DeviceId>) -> Vec<u8> {
     use rmpv::Value as V;
 
     let value = V::Array(vec![
@@ -264,9 +594,27 @@ fn create_update(payload: Vec<(Value, Value)>, ut: UpdateType, acting_device_uui
         V::Nil,
         "ReceiveMessage".into(),
         V::Array(vec![V::Map(vec![
-            ("ContextId".into(), acting_device_uuid.map(|v| v.into()).unwrap_or_else(|| V::Nil)),
+            ("ContextId".into(), acting_device_id.map(|v| v.to_string().into()).unwrap_or_else(|| V::Nil)),
             ("Type".into(), (ut as i32).into()),
             ("Payload".into(), payload.into()),
+        ])]),
+    ]);
+
+    serialize(value)
+}
+
+fn create_anonymous_update(payload: Vec<(Value, Value)>, ut: UpdateType, user_id: UserId) -> Vec<u8> {
+    use rmpv::Value as V;
+
+    let value = V::Array(vec![
+        1.into(),
+        V::Map(vec![]),
+        V::Nil,
+        "AuthRequestResponseRecieved".into(),
+        V::Array(vec![V::Map(vec![
+            ("Type".into(), (ut as i32).into()),
+            ("Payload".into(), payload.into()),
+            ("UserId".into(), user_id.to_string().into()),
         ])]),
     ]);
 
@@ -278,7 +626,7 @@ fn create_ping() -> Vec<u8> {
 }
 
 #[allow(dead_code)]
-#[derive(Eq, PartialEq)]
+#[derive(Copy, Clone, Eq, PartialEq)]
 pub enum UpdateType {
     SyncCipherUpdate = 0,
     SyncCipherCreate = 1,
@@ -305,145 +653,5 @@ pub enum UpdateType {
     None = 100,
 }
 
-pub type Notify<'a> = &'a rocket::State<WebSocketUsers>;
-
-pub fn start_notification_server() -> WebSocketUsers {
-    let users = WebSocketUsers {
-        map: Arc::new(dashmap::DashMap::new()),
-    };
-
-    if CONFIG.websocket_enabled() {
-        let users2 = users.clone();
-        tokio::spawn(async move {
-            let addr = (CONFIG.websocket_address(), CONFIG.websocket_port());
-            info!("Starting WebSockets server on {}:{}", addr.0, addr.1);
-            let listener = TcpListener::bind(addr).await.expect("Can't listen on websocket port");
-
-            let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            CONFIG.set_ws_shutdown_handle(shutdown_tx);
-
-            loop {
-                tokio::select! {
-                    Ok((stream, addr)) = listener.accept() => {
-                        tokio::spawn(handle_connection(stream, users2.clone(), addr));
-                    }
-
-                    _ = &mut shutdown_rx => {
-                        break;
-                    }
-                }
-            }
-
-            info!("Shutting down WebSockets server!")
-        });
-    }
-
-    users
-}
-
-async fn handle_connection(stream: TcpStream, users: WebSocketUsers, addr: SocketAddr) -> Result<(), Error> {
-    let mut user_uuid: Option<String> = None;
-
-    info!("Accepting WS connection from {addr}");
-
-    // Accept connection, do initial handshake, validate auth token and get the user ID
-    use handshake::server::{Request, Response};
-    let mut stream = accept_hdr_async(stream, |req: &Request, res: Response| {
-        if let Some(token) = get_request_token(req) {
-            if let Ok(claims) = crate::auth::decode_login(&token) {
-                user_uuid = Some(claims.sub);
-                return Ok(res);
-            }
-        }
-        Err(Response::builder().status(401).body(None).unwrap())
-    })
-    .await?;
-
-    let user_uuid = user_uuid.expect("User UUID should be set after the handshake");
-
-    // Add a channel to send messages to this client to the map
-    let entry_uuid = uuid::Uuid::new_v4();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
-    users.map.entry(user_uuid.clone()).or_default().push((entry_uuid, tx));
-
-    let mut interval = tokio::time::interval(Duration::from_secs(15));
-    loop {
-        tokio::select! {
-            res = stream.next() =>  {
-                match res {
-                    Some(Ok(message)) => {
-                        // Respond to any pings
-                        if let Message::Ping(ping) = message {
-                            if stream.send(Message::Pong(ping)).await.is_err() {
-                                break;
-                            }
-                            continue;
-                        } else if let Message::Pong(_) = message {
-                            /* Ignored */
-                            continue;
-                        }
-
-                        // We should receive an initial message with the protocol and version, and we will reply to it
-                        if let Message::Text(ref message) = message {
-                            let msg = message.strip_suffix(RECORD_SEPARATOR as char).unwrap_or(message);
-
-                            if serde_json::from_str(msg).ok() == Some(INITIAL_MESSAGE) {
-                                stream.send(Message::binary(INITIAL_RESPONSE)).await?;
-                                continue;
-                            }
-                        }
-
-                        // Just echo anything else the client sends
-                        if stream.send(message).await.is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
-
-            res = rx.recv() => {
-                match res {
-                    Some(res) => {
-                        if stream.send(res).await.is_err() {
-                            break;
-                        }
-                    },
-                    None => break,
-                }
-            }
-
-            _= interval.tick() => {
-                if stream.send(Message::Ping(create_ping())).await.is_err() {
-                    break;
-                }
-            }
-        }
-    }
-
-    info!("Closing WS connection from {addr}");
-
-    //  Delete from map
-    users.map.entry(user_uuid).or_default().retain(|(uuid, _)| uuid != &entry_uuid);
-    Ok(())
-}
-
-fn get_request_token(req: &handshake::server::Request) -> Option<String> {
-    const ACCESS_TOKEN_KEY: &str = "access_token=";
-
-    if let Some(Ok(auth)) = req.headers().get("Authorization").map(|a| a.to_str()) {
-        if let Some(token_part) = auth.strip_prefix("Bearer ") {
-            return Some(token_part.to_owned());
-        }
-    }
-
-    if let Some(params) = req.uri().query() {
-        let params_iter = params.split('&').take(1);
-        for val in params_iter {
-            if let Some(stripped) = val.strip_prefix(ACCESS_TOKEN_KEY) {
-                return Some(stripped.to_owned());
-            }
-        }
-    }
-    None
-}
+pub type Notify<'a> = &'a rocket::State<Arc<WebSocketUsers>>;
+pub type AnonymousNotify<'a> = &'a rocket::State<Arc<AnonymousWebSocketSubscriptions>>;
